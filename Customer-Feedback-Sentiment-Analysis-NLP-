@@ -1,0 +1,192 @@
+# ===============================
+# Customer Feedback Sentiment Analysis (NLP)
+# Colab-Friendly Version
+# ===============================
+
+# Install dependencies (uncomment when running first time in Colab)
+# !pip install pandas numpy scikit-learn matplotlib seaborn joblib
+# !pip install transformers datasets torch accelerate
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+
+# HuggingFace for BERT
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer, DataCollatorWithPadding
+    from datasets import Dataset, load_metric
+    HF_AVAILABLE = True
+except:
+    HF_AVAILABLE = False
+    print("⚠️ HuggingFace not available (install with pip if needed). BERT part will be skipped.")
+
+# -------------------------------
+# 1. Load Dataset
+# -------------------------------
+# Upload your file in Colab: Files → Upload customer_reviews.csv
+# Expected columns: "review" and "label"
+try:
+    data = pd.read_csv("customer_reviews.csv")
+    print("✅ Loaded dataset from CSV")
+except FileNotFoundError:
+    # Synthetic demo dataset
+    texts = [
+        "I love this product! Works perfectly and delivery was fast.",
+        "Terrible quality — broke after one use. Very disappointed.",
+        "Good value for money. Will purchase again.",
+        "Not what I expected. Packaging was poor, product faulty.",
+        "Amazing support from the team, they resolved my issue quickly.",
+        "Worst experience ever. Do not buy!",
+        "Decent product but shipping took too long.",
+        "Exceeded expectations. Highly recommend.",
+        "Battery life is short. Not happy.",
+        "Five stars. Excellent!"
+    ]
+    labels = [1, 0, 1, 0, 1, 0, 0, 1, 0, 1]
+    data = pd.DataFrame({"review": texts, "label": labels})
+    print("⚠️ No CSV found, using synthetic dataset.")
+
+print(data.head())
+
+# Ensure labels are numeric
+if data['label'].dtype == object:
+    label_map = {l: i for i, l in enumerate(sorted(data['label'].unique()))}
+    data['label'] = data['label'].map(label_map)
+    print("Label mapping:", label_map)
+
+# -------------------------------
+# 2. EDA - Label Distribution
+# -------------------------------
+plt.figure(figsize=(5,4))
+sns.countplot(x=data["label"])
+plt.title("Label Distribution")
+plt.show()
+
+# -------------------------------
+# 3. Train-Test Split
+# -------------------------------
+X = data["review"].values
+y = data["label"].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# -------------------------------
+# 4. TF-IDF + Logistic Regression
+# -------------------------------
+print("\n🚀 Training TF-IDF + Logistic Regression...")
+pipe = Pipeline([
+    ("tfidf", TfidfVectorizer(max_features=10000, ngram_range=(1,2), stop_words="english")),
+    ("clf", LogisticRegression(max_iter=1000, solver="liblinear"))
+])
+
+pipe.fit(X_train, y_train)
+y_pred = pipe.predict(X_test)
+
+print("\nClassification Report (TF-IDF + LR):")
+print(classification_report(y_test, y_pred))
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print("F1 Score:", f1_score(y_test, y_pred, average="weighted"))
+
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.title("Confusion Matrix (TF-IDF + LR)")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.show()
+
+# Save pipeline
+os.makedirs("outputs", exist_ok=True)
+joblib.dump(pipe, "outputs/tfidf_logreg_pipeline.joblib")
+print("✅ Saved TF-IDF model to outputs/tfidf_logreg_pipeline.joblib")
+
+# Export predictions
+pred_df = pd.DataFrame({"review": X_test, "true_label": y_test, "pred_label": y_pred})
+pred_df.to_csv("outputs/tfidf_predictions.csv", index=False)
+print("✅ Saved predictions to outputs/tfidf_predictions.csv")
+
+# -------------------------------
+# 5. (Optional) BERT Fine-tuning
+# -------------------------------
+if HF_AVAILABLE:
+    print("\n🚀 Training BERT model (may take time)...")
+
+    df = data.rename(columns={"review":"text","label":"label"})
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['label'])
+    train_ds = Dataset.from_pandas(train_df.reset_index(drop=True))
+    test_ds = Dataset.from_pandas(test_df.reset_index(drop=True))
+
+    model_name = "bert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    def tokenize_fn(examples):
+        return tokenizer(examples["text"], truncation=True)
+
+    train_ds = train_ds.map(tokenize_fn, batched=True)
+    test_ds = test_ds.map(tokenize_fn, batched=True)
+
+    num_labels = len(set(df["label"]))
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    metric_acc = load_metric("accuracy")
+    metric_f1 = load_metric("f1")
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=-1)
+        return {
+            "accuracy": metric_acc.compute(predictions=preds, references=labels)["accuracy"],
+            "f1": metric_f1.compute(predictions=preds, references=labels, average="weighted")["f1"]
+        }
+
+    training_args = TrainingArguments(
+        output_dir="outputs/bert",
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=2e-5,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        num_train_epochs=2,
+        weight_decay=0.01,
+        logging_steps=10,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1"
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=test_ds,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics
+    )
+
+    trainer.train()
+    print("\n📊 Evaluating BERT model...")
+    metrics = trainer.evaluate()
+    print(metrics)
+
+    # Save model + predictions
+    trainer.save_model("outputs/bert_model")
+    tokenizer.save_pretrained("outputs/bert_model")
+    preds = trainer.predict(test_ds).predictions.argmax(-1)
+    out = pd.DataFrame({"text": test_df["text"], "true": test_df["label"], "pred": preds})
+    out.to_csv("outputs/bert_predictions.csv", index=False)
+    print("✅ BERT model & predictions saved in outputs/")
+else:
+    print("\n⚠️ Skipping BERT (transformers/torch not installed).")
